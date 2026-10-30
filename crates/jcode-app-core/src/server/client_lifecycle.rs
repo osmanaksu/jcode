@@ -2644,6 +2644,7 @@ pub(super) async fn handle_client(
                 model,
                 effort,
                 label,
+                worktree,
             } => {
                 let spawn_mode = match parse_swarm_spawn_mode(id, spawn_mode, &client_event_tx) {
                     Some(spawn_mode) => spawn_mode,
@@ -2654,6 +2655,7 @@ pub(super) async fn handle_client(
                     req_session_id,
                     lane_id,
                     working_dir,
+                    worktree,
                     initial_message,
                     request_nonce,
                     spawn_mode,

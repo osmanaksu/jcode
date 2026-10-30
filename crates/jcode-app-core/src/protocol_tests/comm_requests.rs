@@ -452,6 +452,7 @@ fn test_comm_spawn_roundtrip_with_optional_nonce() -> Result<()> {
         session_id: "sess_coord".to_string(),
         lane_id: Some("lane:1:parser".to_string()),
         working_dir: Some("/tmp/project".to_string()),
+        worktree: false,
         initial_message: Some("Start here".to_string()),
         request_nonce: Some("planner-fresh-123".to_string()),
         spawn_mode: Some("headless".to_string()),

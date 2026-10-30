@@ -1415,6 +1415,7 @@ async fn spawn_assignment_session(ctx: &ToolContext, params: &CommunicateInput) 
         id: REQUEST_ID,
         session_id: ctx.session_id.clone(),
         working_dir: params.working_dir.clone(),
+        worktree: params.worktree,
         initial_message: None,
         request_nonce: Some(fresh_spawn_request_nonce(ctx)),
         spawn_mode: params.spawn_mode.clone(),
@@ -1724,6 +1725,11 @@ struct CommunicateInput {
     role: Option<String>,
     #[serde(default)]
     working_dir: Option<String>,
+    /// When `true`, give the spawned worker its own isolated git worktree
+    /// (sibling of the coordinator's working directory) so its edits do not
+    /// pollute the main checkout. Defaults to `false` (shared workspace).
+    #[serde(default)]
+    worktree: bool,
     #[serde(default)]
     initial_message: Option<String>,
     #[serde(default)]
@@ -1899,6 +1905,10 @@ impl Tool for CommunicateTool {
                 "working_dir": {
                     "type": "string",
                     "description": "Optional working directory for spawn."
+                },
+                "worktree": {
+                    "type": "boolean",
+                    "description": "For spawn: when true, give the worker its own isolated git worktree (sibling of the working directory) so its edits do not pollute the main checkout. Defaults to false (shared workspace)."
                 },
                 "prompt": {
                     "type": "string",
@@ -2506,6 +2516,7 @@ impl Tool for CommunicateTool {
                     id: REQUEST_ID,
                     session_id: ctx.session_id.clone(),
                     working_dir: params.working_dir.clone(),
+                    worktree: params.worktree,
                     initial_message: params.spawn_initial_message(),
                     request_nonce: None,
                     spawn_mode: params.spawn_mode.clone(),

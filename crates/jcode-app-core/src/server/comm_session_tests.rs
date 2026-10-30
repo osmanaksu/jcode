@@ -2,9 +2,9 @@
 
 use super::{
     CoordinatorSpawnIdentity, ensure_spawn_coordinator_swarm, prepare_visible_spawn_session,
-    register_visible_spawned_member, resolve_coordinator_spawn_identity, resolve_spawn_working_dir,
-    resolve_stop_target_session, resolve_swarm_spawn_selection, spawn_admission_lock,
-    swarm_stop_allowed_by_owner,
+    register_visible_spawned_member, resolve_coordinator_spawn_identity, resolve_spawn_worktree,
+    resolve_spawn_working_dir, resolve_stop_target_session, resolve_swarm_spawn_selection,
+    spawn_admission_lock, swarm_stop_allowed_by_owner,
 };
 use crate::agent::Agent;
 use crate::message::{Message, ToolDefinition};
@@ -948,6 +948,7 @@ async fn session_agent_models_update_and_spawn_while_coordinator_busy() {
             "routing-swarm",
             None,
             Some(temp.path().to_string_lossy().into_owned()),
+            false,
             None,
             Some(crate::config::SwarmSpawnMode::Headless),
             None,
@@ -1290,6 +1291,157 @@ async fn spawn_admission_lock_serializes_per_swarm_only() {
             .await
             .is_ok()
     );
+}
+
+// ── Worktree isolation (swarm → jcode-sdk::worktrees bridge) ──────────────
+//
+// `resolve_spawn_worktree` is the single seam between the swarm spawn path
+// and the SDK's blocking `git worktree add`. It is pure (no session state,
+// no locks) so the spawn_blocking requirement from m07 (blocking git
+// subprocess must not run on the async executor) is structurally satisfied
+// and directly testable.
+//
+// Branch naming is deterministic: `jcode-swarm/<swarm_id>/<session_id>`.
+// The SDK's `safe_name` percent-encodes `/` so the branch stays a single
+// literal ref. This makes replay idempotent (same swarm+session → same
+// branch) and lets the integration/cleanup phase (Scope 2) find the
+// worktree without extra bookkeeping.
+
+#[tokio::test]
+async fn worktree_disabled_returns_none_and_leaves_main_workspace_unchanged() {
+    let result = resolve_spawn_worktree(
+        Some("/tmp/main-workspace".to_string()),
+        false,
+        "swarm-1",
+        "session-abc",
+    )
+    .await
+    .expect("worktree=false must not error");
+    assert!(result.is_none(), "worktree=false must not create a worktree");
+}
+
+#[tokio::test]
+async fn worktree_enabled_without_working_dir_returns_error() {
+    let result = resolve_spawn_worktree(None, true, "swarm-1", "session-abc").await;
+    assert!(result.is_err(), "worktree=true with no base dir must fail");
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("git working directory"));
+}
+
+// Helper: run git in a specific directory.
+fn git_in(dir: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("git").current_dir(dir).args(args).output()
+}
+
+fn init_test_repo(repo_path: &std::path::Path) {
+    std::fs::create_dir(repo_path).expect("create repo dir");
+    let git = |args: &[&str]| -> std::process::Output {
+        std::process::Command::new("git")
+            .current_dir(repo_path)
+            .args(args)
+            .output()
+            .expect("git available")
+    };
+    assert!(git(&["init", "-b", "main"]).status.success());
+    assert!(git(&["config", "user.name", "WT Test"]).status.success());
+    assert!(git(&["config", "user.email", "wt-test@example.invalid"]).status.success());
+    std::fs::write(repo_path.join("tracked.txt"), "original").expect("write tracked");
+    assert!(git(&["add", "tracked.txt"]).status.success());
+    assert!(git(&["commit", "-m", "initial"]).status.success());
+}
+
+#[tokio::test]
+async fn worktree_enabled_creates_sibling_tree_and_returns_path() {
+    let temp = tempfile::TempDir::new().expect("temp root");
+    let repo_path = temp.path().join("myrepo");
+    init_test_repo(&repo_path);
+    let repo_str = repo_path.to_str().expect("utf8").to_string();
+
+    let result = resolve_spawn_worktree(
+        Some(repo_str.clone()),
+        true,
+        "swarm-1",
+        "session-abc",
+    )
+    .await
+    .expect("worktree creation should not error")
+    .expect("worktree=true must return Some(path)");
+
+    let wt_path = std::path::Path::new(&result);
+    assert!(wt_path.is_dir(), "worktree path should be a real directory: {result}");
+    assert!(result.contains("-worktrees"), "sibling root expected: {result}");
+    // Main repo untouched.
+    let main_content = std::fs::read_to_string(repo_path.join("tracked.txt")).expect("read");
+    assert_eq!(main_content, "original");
+    // Branch is the expected one.
+    let branch_out = git_in(&result, &["rev-parse", "--abbrev-ref", "HEAD"]).expect("branch");
+    let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+    assert_eq!(branch, "jcode-swarm/swarm-1/session-abc");
+}
+
+#[tokio::test]
+async fn worktree_enabled_isolates_dirty_edits() {
+    let temp = tempfile::TempDir::new().expect("temp root");
+    let repo_path = temp.path().join("myrepo");
+    init_test_repo(&repo_path);
+    let repo_str = repo_path.to_str().expect("utf8").to_string();
+
+    // Dirty the main repo: staged + unstaged + untracked.
+    std::fs::write(repo_path.join("tracked.txt"), "staged-change").expect("dirty staged");
+    git_in(&repo_str, &["add", "tracked.txt"]).expect("git add");
+    std::fs::write(repo_path.join("tracked.txt"), "unstaged-change").expect("dirty unstaged");
+    std::fs::write(repo_path.join("untracked.txt"), "private").expect("dirty untracked");
+
+    let result = resolve_spawn_worktree(
+        Some(repo_str.clone()),
+        true,
+        "swarm-2",
+        "session-xyz",
+    )
+    .await
+    .expect("worktree creation should not error")
+    .expect("worktree=true must return Some(path)");
+
+    let wt_file = std::path::Path::new(&result).join("tracked.txt");
+    let wt_content = std::fs::read_to_string(&wt_file).expect("read worktree tracked");
+    assert_eq!(wt_content, "original", "worktree must start from HEAD");
+    assert!(
+        !std::path::Path::new(&result).join("untracked.txt").exists(),
+        "untracked files must not leak into the worktree"
+    );
+}
+
+#[tokio::test]
+async fn worktree_branch_is_deterministic_per_swarm_and_session() {
+    let temp = tempfile::TempDir::new().expect("temp root");
+    let repo_path = temp.path().join("myrepo");
+    init_test_repo(&repo_path);
+    let repo_str = repo_path.to_str().expect("utf8").to_string();
+
+    let first = resolve_spawn_worktree(
+        Some(repo_str.clone()),
+        true,
+        "swarm-9",
+        "session-42",
+    )
+    .await
+    .expect("first worktree creation should not error")
+    .expect("first worktree must return Some(path)");
+
+    // Duplicate must be rejected (branch already exists).
+    let second = resolve_spawn_worktree(
+        Some(repo_str.clone()),
+        true,
+        "swarm-9",
+        "session-42",
+    )
+    .await;
+    assert!(second.is_err(), "duplicate worktree must be rejected");
+    let err = second.unwrap_err().to_string();
+    assert!(err.contains("-worktrees"), "deterministic path in error: {err}");
+    assert!(std::path::Path::new(&first).is_dir());
 }
 
 #[path = "comm_session_effort_tests.rs"]

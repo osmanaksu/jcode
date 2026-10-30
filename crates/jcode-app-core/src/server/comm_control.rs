@@ -1623,6 +1623,7 @@ pub(super) async fn handle_comm_assign_next(
                 &swarm_id,
                 None,
                 working_dir.clone(),
+                false,
                 None,
                 None,
                 model.clone(),

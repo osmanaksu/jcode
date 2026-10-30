@@ -141,6 +141,53 @@ async fn resolve_spawn_working_dir(
         .filter(|dir| !dir.trim().is_empty())
 }
 
+/// Resolve a git worktree for an isolated swarm worker (Scope 1: creation only).
+///
+/// When `worktree` is `false`, returns `None` immediately (no filesystem
+/// side effects) — the caller keeps the main-workspace `working_dir`
+/// unchanged.
+///
+/// When `worktree` is `true`, runs `git worktree add` via the SDK on a
+/// blocking thread (m07: blocking subprocess must not run on the async
+/// executor). The branch name is deterministic —
+/// `jcode-swarm/<swarm_id>/<session_id>` — so replay is idempotent and the
+/// integration/cleanup phase (Scope 2) can find the worktree without extra
+/// bookkeeping. The SDK's `safe_name` percent-encodes `/` in the branch so
+/// it stays a single literal git ref.
+///
+/// Returns `Ok(path)` on success, or an error explaining why the worktree
+/// could not be created (missing base dir, git not on PATH, branch already
+/// exists, etc.).
+pub(super) async fn resolve_spawn_worktree(
+    working_dir: Option<String>,
+    worktree: bool,
+    swarm_id: &str,
+    session_id: &str,
+) -> anyhow::Result<Option<String>> {
+    if !worktree {
+        return Ok(None);
+    }
+    let base_dir = working_dir
+        .filter(|dir| !dir.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "worktree isolation requires a git working directory; none resolved"
+            )
+        })?;
+    let branch = format!("jcode-swarm/{swarm_id}/{session_id}");
+    let base_dir_owned = base_dir.clone();
+    let branch_owned = branch.clone();
+    // m07: `git worktree add` is a blocking subprocess. Run it off the async
+    // executor so concurrent spawns and the coordinator's turn are not stalled.
+    let wt = tokio::task::spawn_blocking(move || {
+        jcode_sdk::worktrees::create(&base_dir_owned, &branch_owned)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("worktree task join failed: {e}"))?
+    .map_err(|e| anyhow::anyhow!("git worktree add failed: {e}"))?;
+    Ok(Some(wt.path))
+}
+
 /// Launch a headed window for `session_id`, exporting the given spawn context
 /// (`JCODE_SPAWN_KIND`, swarm/coordinator ids, ...) to spawn hooks and
 /// spawned terminals so external programs can reroute the window.
@@ -581,6 +628,7 @@ pub(super) async fn spawn_swarm_agent(
     swarm_id: &str,
     lane_id: Option<String>,
     working_dir: Option<String>,
+    worktree: bool,
     initial_message: Option<String>,
     spawn_mode: Option<SwarmSpawnMode>,
     requested_model: Option<String>,
@@ -604,8 +652,40 @@ pub(super) async fn spawn_swarm_agent(
     agents_config
         .validate_swarm_model_request(requested_model.as_deref())
         .map_err(anyhow::Error::msg)?;
-    let resolved_working_dir =
+    let mut resolved_working_dir =
         resolve_spawn_working_dir(working_dir, req_session_id, sessions, swarm_members).await;
+    // Scope 1 worktree isolation: when the coordinator asks for an isolated
+    // worker, create a sibling git worktree *before* the session is created so
+    // every downstream binding (visible cwd, headless `create_session:{dir}`,
+    // member registration) points at the worktree, not the main workspace.
+    // Identity suffix is the coordinator session id — deterministic per
+    // (swarm, coordinator), so a replay reuses the same branch.
+    if worktree {
+        match resolve_spawn_worktree(
+            resolved_working_dir.clone(),
+            true,
+            swarm_id,
+            req_session_id,
+        )
+        .await
+        {
+            Ok(Some(wt_path)) => {
+                crate::logging::info(&format!(
+                    "Swarm spawn: created isolated worktree for worker (swarm={swarm_id} coordinator={req_session_id}) at {wt_path}"
+                ));
+                resolved_working_dir = Some(wt_path);
+            }
+            Err(error) => {
+                crate::logging::warn(&format!(
+                    "Swarm spawn: worktree isolation failed, falling back to shared workspace (swarm={swarm_id} coordinator={req_session_id}): {error}"
+                ));
+            }
+            Ok(None) => {
+                // worktree=true but resolve returned None — cannot happen, but
+                // keep the fallback explicit.
+            }
+        }
+    }
     let coordinator = resolve_coordinator_spawn_identity(req_session_id, sessions).await;
     let coordinator_is_canary = coordinator.is_canary;
     // Capture the requesting client's terminal env so spawn hooks place the new
@@ -884,6 +964,7 @@ pub(super) async fn handle_comm_spawn(
     req_session_id: String,
     lane_id: Option<String>,
     working_dir: Option<String>,
+    worktree: bool,
     initial_message: Option<String>,
     request_nonce: Option<String>,
     spawn_mode: Option<SwarmSpawnMode>,
@@ -970,6 +1051,7 @@ pub(super) async fn handle_comm_spawn(
         &swarm_id,
         lane_id,
         working_dir,
+        worktree,
         initial_message,
         spawn_mode,
         model,

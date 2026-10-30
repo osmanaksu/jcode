@@ -708,6 +708,12 @@ pub enum Request {
         /// otherwise derived from the first line of `initial_message`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+        /// When `true`, the spawned worker is given its own isolated git
+        /// worktree (sibling of the coordinator's working directory) so its
+        /// edits do not pollute the main checkout. When `false` (default) the
+        /// worker shares the coordinator's working directory as before.
+        #[serde(default)]
+        worktree: bool,
     },
 
     /// List models/routes available for spawning swarm agents

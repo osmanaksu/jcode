@@ -3279,6 +3279,7 @@ dependencies = [
  "jcode-productivity-core",
  "jcode-provider-core",
  "jcode-schema-dialect",
+ "jcode-sdk",
  "jcode-selfdev-types",
  "jcode-session-types",
  "jcode-setup-hints",

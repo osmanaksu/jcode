@@ -98,6 +98,7 @@ jcode-task-types = { path = "../jcode-task-types" }
 jcode-tool-core = { path = "../jcode-tool-core" }
 jcode-codemode = { path = "../jcode-codemode" }
 jcode-tool-types = { path = "../jcode-tool-types" }
+jcode-sdk = { path = "../jcode-sdk" }
 
 # Archive extraction (for auto-update)
 flate2 = "1"
