@@ -141,6 +141,65 @@ async fn resolve_spawn_working_dir(
         .filter(|dir| !dir.trim().is_empty())
 }
 
+/// Collapse a worker label into a git-branch-safe slug.
+///
+/// Keeps ASCII alphanumerics and `-`/`_`; every other byte becomes a literal
+/// `-`. Trailing `-` runs are trimmed. An empty/None label returns `None` so
+/// the caller can fall back to a unique component. This keeps the branch name
+/// readable (one literal ref segment) without depending on the SDK's
+/// percent-encoding for the worker discriminator.
+fn worker_branch_slug(label: Option<&str>) -> Option<String> {
+    let label = label?.trim();
+    if label.is_empty() {
+        return None;
+    }
+    let mut slug = String::with_capacity(label.len());
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            slug.push(ch);
+        } else {
+            slug.push('-');
+        }
+    }
+    let trimmed = slug.trim_end_matches('-');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Build the deterministic, per-worker-unique branch name for an isolated
+/// swarm worktree.
+///
+/// Shape: `jcode-swarm/<swarm_id>/<coordinator_session>/<worker>`, where
+/// `<worker>` is the slugified worker label when one was supplied, and a
+/// unique `w<epoch-nanos>` component otherwise. This is what makes concurrent
+/// spawns from the *same* coordinator safe: previously the branch was
+/// `jcode-swarm/<swarm_id>/<coordinator_session>` — identical for every worker
+/// of a coordinator — so the second parallel `git worktree add -b` failed with
+/// "branch already exists" and the worker fell back to the shared workspace
+/// (a real race when several workers edit the same file). Keeping
+/// `<coordinator_session>` in the path preserves replay idempotency for a
+/// labelled worker (same swarm + coordinator + label → same branch) while the
+/// per-worker tail guarantees distinct branches for distinct workers.
+fn worker_worktree_branch(
+    swarm_id: &str,
+    coordinator_session_id: &str,
+    label: Option<&str>,
+) -> String {
+    match worker_branch_slug(label) {
+        Some(slug) => format!("jcode-swarm/{swarm_id}/{coordinator_session_id}/{slug}"),
+        None => format!(
+            "jcode-swarm/{swarm_id}/{coordinator_session_id}/w{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ),
+    }
+}
+
 /// Resolve a git worktree for an isolated swarm worker (Scope 1: creation only).
 ///
 /// When `worktree` is `false`, returns `None` immediately (no filesystem
@@ -149,11 +208,11 @@ async fn resolve_spawn_working_dir(
 ///
 /// When `worktree` is `true`, runs `git worktree add` via the SDK on a
 /// blocking thread (m07: blocking subprocess must not run on the async
-/// executor). The branch name is deterministic —
-/// `jcode-swarm/<swarm_id>/<session_id>` — so replay is idempotent and the
-/// integration/cleanup phase (Scope 2) can find the worktree without extra
-/// bookkeeping. The SDK's `safe_name` percent-encodes `/` in the branch so
-/// it stays a single literal git ref.
+/// executor). The branch name is deterministic and **per-worker unique** —
+/// see [`worker_worktree_branch`] — so concurrent spawns from the same
+/// coordinator get distinct branches (no "branch already exists" race) while a
+/// labelled worker's replay stays idempotent. The SDK's `safe_name`
+/// percent-encodes `/` in the branch so it stays a single literal git ref.
 ///
 /// Returns `Ok(path)` on success, or an error explaining why the worktree
 /// could not be created (missing base dir, git not on PATH, branch already
@@ -163,6 +222,7 @@ pub(super) async fn resolve_spawn_worktree(
     worktree: bool,
     swarm_id: &str,
     session_id: &str,
+    label: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
     if !worktree {
         return Ok(None);
@@ -174,7 +234,7 @@ pub(super) async fn resolve_spawn_worktree(
                 "worktree isolation requires a git working directory; none resolved"
             )
         })?;
-    let branch = format!("jcode-swarm/{swarm_id}/{session_id}");
+    let branch = worker_worktree_branch(swarm_id, session_id, label);
     let base_dir_owned = base_dir.clone();
     let branch_owned = branch.clone();
     // m07: `git worktree add` is a blocking subprocess. Run it off the async
@@ -666,6 +726,7 @@ pub(super) async fn spawn_swarm_agent(
             true,
             swarm_id,
             req_session_id,
+            label.as_deref(),
         )
         .await
         {

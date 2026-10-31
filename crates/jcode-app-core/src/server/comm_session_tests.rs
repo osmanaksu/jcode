@@ -1314,6 +1314,7 @@ async fn worktree_disabled_returns_none_and_leaves_main_workspace_unchanged() {
         false,
         "swarm-1",
         "session-abc",
+        Some("worker-1"),
     )
     .await
     .expect("worktree=false must not error");
@@ -1322,7 +1323,7 @@ async fn worktree_disabled_returns_none_and_leaves_main_workspace_unchanged() {
 
 #[tokio::test]
 async fn worktree_enabled_without_working_dir_returns_error() {
-    let result = resolve_spawn_worktree(None, true, "swarm-1", "session-abc").await;
+    let result = resolve_spawn_worktree(None, true, "swarm-1", "session-abc", None).await;
     assert!(result.is_err(), "worktree=true with no base dir must fail");
     assert!(result
         .unwrap_err()
@@ -1364,6 +1365,7 @@ async fn worktree_enabled_creates_sibling_tree_and_returns_path() {
         true,
         "swarm-1",
         "session-abc",
+        Some("worker-1"),
     )
     .await
     .expect("worktree creation should not error")
@@ -1375,10 +1377,10 @@ async fn worktree_enabled_creates_sibling_tree_and_returns_path() {
     // Main repo untouched.
     let main_content = std::fs::read_to_string(repo_path.join("tracked.txt")).expect("read");
     assert_eq!(main_content, "original");
-    // Branch is the expected one.
+    // Branch is the expected per-worker one (label slugified onto the tail).
     let branch_out = git_in(&result, &["rev-parse", "--abbrev-ref", "HEAD"]).expect("branch");
     let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
-    assert_eq!(branch, "jcode-swarm/swarm-1/session-abc");
+    assert_eq!(branch, "jcode-swarm/swarm-1/session-abc/worker-1");
 }
 
 #[tokio::test]
@@ -1399,6 +1401,7 @@ async fn worktree_enabled_isolates_dirty_edits() {
         true,
         "swarm-2",
         "session-xyz",
+        Some("dirty-worker"),
     )
     .await
     .expect("worktree creation should not error")
@@ -1414,34 +1417,131 @@ async fn worktree_enabled_isolates_dirty_edits() {
 }
 
 #[tokio::test]
-async fn worktree_branch_is_deterministic_per_swarm_and_session() {
+async fn worktree_branch_is_deterministic_for_same_label_but_unique_per_worker() {
     let temp = tempfile::TempDir::new().expect("temp root");
     let repo_path = temp.path().join("myrepo");
     init_test_repo(&repo_path);
     let repo_str = repo_path.to_str().expect("utf8").to_string();
 
+    // Same swarm + coordinator + label → the *same* branch → replay is
+    // idempotent: the second identical spawn is rejected (branch exists).
     let first = resolve_spawn_worktree(
         Some(repo_str.clone()),
         true,
         "swarm-9",
         "session-42",
+        Some("worker-a"),
     )
     .await
     .expect("first worktree creation should not error")
     .expect("first worktree must return Some(path)");
 
-    // Duplicate must be rejected (branch already exists).
-    let second = resolve_spawn_worktree(
+    let replay = resolve_spawn_worktree(
         Some(repo_str.clone()),
         true,
         "swarm-9",
         "session-42",
+        Some("worker-a"),
     )
     .await;
-    assert!(second.is_err(), "duplicate worktree must be rejected");
-    let err = second.unwrap_err().to_string();
+    assert!(replay.is_err(), "same-label duplicate must be rejected");
+    let err = replay.unwrap_err().to_string();
     assert!(err.contains("-worktrees"), "deterministic path in error: {err}");
     assert!(std::path::Path::new(&first).is_dir());
+
+    // But a *different* worker (different label) of the same coordinator must
+    // get its OWN branch and succeed — this is the fix for the parallel-spawn
+    // race where every worker shared one branch and the second `git worktree
+    // add -b` failed with "branch already exists".
+    let sibling = resolve_spawn_worktree(
+        Some(repo_str.clone()),
+        true,
+        "swarm-9",
+        "session-42",
+        Some("worker-b"),
+    )
+    .await
+    .expect("different-label sibling worker must get its own worktree")
+    .expect("sibling worktree must return Some(path)");
+
+    assert_ne!(first, sibling, "workers must land in distinct worktrees");
+    let branch_a = git_in(&first, &["rev-parse", "--abbrev-ref", "HEAD"]).expect("branch a");
+    let branch_b = git_in(&sibling, &["rev-parse", "--abbrev-ref", "HEAD"]).expect("branch b");
+    assert_eq!(
+        String::from_utf8_lossy(&branch_a.stdout).trim(),
+        "jcode-swarm/swarm-9/session-42/worker-a"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&branch_b.stdout).trim(),
+        "jcode-swarm/swarm-9/session-42/worker-b"
+    );
+}
+
+// THE STRESS TEST: three workers of the same coordinator, spawned
+// concurrently against the same base repo, all writing to the same file. Each
+// must land in its own isolated worktree (no "branch already exists" race, no
+// fallback to the shared workspace) and the main repo must stay untouched.
+// Without the per-worker branch fix, worker #2 and #3 would fail creation and
+// race each other in the main workspace.
+#[tokio::test]
+async fn stress_three_concurrent_workers_same_file_no_race() {
+    let temp = tempfile::TempDir::new().expect("temp root");
+    let repo_path = temp.path().join("myrepo");
+    init_test_repo(&repo_path);
+    let repo_str = repo_path.to_str().expect("utf8").to_string();
+
+    // Clone the label into an owned String so the `async move` block owns all
+    // of its captures (no borrows crossing into the returned future).
+    let spawn_one = |label: String| {
+        let repo = repo_str.clone();
+        async move {
+            resolve_spawn_worktree(Some(repo), true, "swarm-stress", "coord-1", Some(label.as_str()))
+                .await
+                .expect("concurrent worktree creation must not error")
+                .expect("concurrent worktree must return Some(path)")
+        }
+    };
+
+    // Fire all three at once — true concurrency, not sequential.
+    let (path_a, path_b, path_c) = tokio::join!(
+        spawn_one("worker-a".to_string()),
+        spawn_one("worker-b".to_string()),
+        spawn_one("worker-c".to_string()),
+    );
+
+    // All three distinct.
+    assert_ne!(path_a, path_b, "worker-a and worker-b must be distinct");
+    assert_ne!(path_b, path_c, "worker-b and worker-c must be distinct");
+    assert_ne!(path_a, path_c, "worker-a and worker-c must be distinct");
+
+    // Each worktree is real, on its own branch, starting from HEAD.
+    for (idx, path) in [&path_a, &path_b, &path_c].into_iter().enumerate() {
+        let p = std::path::Path::new(path);
+        assert!(p.is_dir(), "worktree {idx} must be a real dir: {path}");
+        let branch = git_in(path, &["rev-parse", "--abbrev-ref", "HEAD"]).expect("branch");
+        let b = String::from_utf8_lossy(&branch.stdout).trim().to_string();
+        let expected = format!("jcode-swarm/swarm-stress/coord-1/worker-{}", ['a', 'b', 'c'][idx]);
+        assert_eq!(b, expected, "worktree {idx} must be on its own branch");
+        let content =
+            std::fs::read_to_string(p.join("tracked.txt")).unwrap_or_default();
+        assert_eq!(content, "original", "worktree {idx} must start from HEAD");
+    }
+
+    // Simulate each worker editing the same file in its own worktree.
+    for (idx, path) in [&path_a, &path_b, &path_c].into_iter().enumerate() {
+        let file = std::path::Path::new(path).join("tracked.txt");
+        std::fs::write(&file, format!("edit-by-worker-{}", ['a', 'b', 'c'][idx])).unwrap_or_else(|e| panic!("worker {idx} edit failed: {e}"));
+    }
+
+    // Main repo is COMPLETELY untouched — no race leaked into it.
+    let main = std::fs::read_to_string(repo_path.join("tracked.txt")).expect("read main");
+    assert_eq!(main, "original", "main repo must be untouched by worker edits");
+    assert!(!repo_path.join("untracked.txt").exists(), "main repo must not gain files");
+
+    // Git sees exactly 4 worktrees now (main + 3 workers).
+    let list = git_in(&repo_str, &["worktree", "list"]).expect("worktree list");
+    let n = String::from_utf8_lossy(&list.stdout).lines().count();
+    assert_eq!(n, 4, "expected main + 3 worker worktrees, got {n}");
 }
 
 #[path = "comm_session_effort_tests.rs"]
