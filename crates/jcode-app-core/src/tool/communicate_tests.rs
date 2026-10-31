@@ -1123,3 +1123,90 @@ mod credential_failures;
 include!("communicate_tests/input_format.rs");
 include!("communicate_tests/end_to_end.rs");
 include!("communicate_tests/assignment.rs");
+
+/// Regression tests: the LLM (notably DeepSeek-reasoner) emits the `worktree`
+/// flag as a JSON *string* (`"true"`/`"false"`) rather than a boolean. A strict
+/// `bool` field rejected `"true"` with `invalid type: string`, turning a valid
+/// `spawn worktree=true` into a hard spawn error. `deserialize_worktree_bool`
+/// coerces the string literals while still rejecting malformed payloads.
+mod worktree_bool_deserialization {
+    use super::super::CommunicateInput;
+    use serde_json::json;
+
+    fn parse_worktree(v: serde_json::Value) -> Result<CommunicateInput, serde_json::Error> {
+        serde_json::from_value(v)
+    }
+
+    #[test]
+    fn string_true_coerces_to_true() {
+        let input: CommunicateInput = parse_worktree(json!({
+            "action": "spawn",
+            "label": "x",
+            "worktree": "true"
+        }))
+        .expect("string \"true\" should coerce to true");
+        assert!(input.worktree, "string \"true\" must resolve to worktree=true");
+    }
+
+    #[test]
+    fn string_true_uppercase_coerces_to_true() {
+        let input: CommunicateInput =
+            parse_worktree(json!({ "action": "spawn", "worktree": "True" }))
+                .expect("case-insensitive \"True\" should coerce");
+        assert!(input.worktree);
+    }
+
+    #[test]
+    fn string_false_coerces_to_false() {
+        let input: CommunicateInput = parse_worktree(json!({
+            "action": "spawn",
+            "worktree": "false"
+        }))
+        .expect("string \"false\" should coerce to false");
+        assert!(!input.worktree);
+    }
+
+    #[test]
+    fn real_boolean_true_still_works() {
+        let input: CommunicateInput =
+            parse_worktree(json!({ "action": "spawn", "worktree": true }))
+                .expect("real boolean true must still deserialize");
+        assert!(input.worktree);
+    }
+
+    #[test]
+    fn real_boolean_false_still_works() {
+        let input: CommunicateInput =
+            parse_worktree(json!({ "action": "spawn", "worktree": false }))
+                .expect("real boolean false must still deserialize");
+        assert!(!input.worktree);
+    }
+
+    #[test]
+    fn absent_worktree_defaults_to_false() {
+        let input: CommunicateInput =
+            parse_worktree(json!({ "action": "spawn" }))
+                .expect("absent worktree should default");
+        assert!(!input.worktree, "absent worktree must default to false");
+    }
+
+    #[test]
+    fn malformed_string_still_errors() {
+        let err = parse_worktree(json!({ "action": "spawn", "worktree": "yes" }))
+            .expect_err("non-boolean string must still error");
+        assert!(
+            err.to_string().contains("boolean") || err.to_string().contains("invalid"),
+            "error should describe the invalid value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn non_boolean_non_string_still_errors() {
+        let err = parse_worktree(json!({ "action": "spawn", "worktree": 1 }))
+            .expect_err("a number must not be silently coerced to bool");
+        assert!(
+            err.to_string().contains("boolean") || err.to_string().contains("invalid"),
+            "error should describe the invalid type, got: {err}"
+        );
+    }
+}

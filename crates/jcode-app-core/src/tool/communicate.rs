@@ -1699,7 +1699,38 @@ const ADVERTISED_SWARM_ACTIONS: &[&str] = &[
     "list_swarms",
 ];
 
-#[derive(Clone, Deserialize)]
+/// Deserialize a `bool` that tolerates LLM-emitted string booleans.
+///
+/// Some models (notably DeepSeek-reasoner) emit flag-style tool arguments as
+/// JSON strings (`"true"`/`"false"`) rather than booleans. A strict
+/// `bool` field rejects `"true"` with `invalid type: string`, which turns an
+/// otherwise valid `spawn worktree=true` into a hard spawn error. This
+/// deserializer accepts real booleans as-is and coerces the string literals
+/// `"true"`/`"false"` (case-insensitive). Any other type or string still
+/// errors, so malformed payloads are not silently coerced.
+fn deserialize_worktree_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Bool(b) => Ok(b),
+        serde_json::Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            other => Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Str(other),
+                &"boolean or \"true\"/\"false\" string",
+            )),
+        },
+        other => Err(serde::de::Error::invalid_type(
+            serde::de::Unexpected::Other(&format!("{other:?}")),
+            &"boolean",
+        )),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct CommunicateInput {
     action: String,
     #[serde(default)]
@@ -1728,7 +1759,9 @@ struct CommunicateInput {
     /// When `true`, give the spawned worker its own isolated git worktree
     /// (sibling of the coordinator's working directory) so its edits do not
     /// pollute the main checkout. Defaults to `false` (shared workspace).
-    #[serde(default)]
+    /// Accepts real booleans or LLM-emitted string booleans (see
+    /// `deserialize_worktree_bool`).
+    #[serde(default, deserialize_with = "deserialize_worktree_bool")]
     worktree: bool,
     #[serde(default)]
     initial_message: Option<String>,
